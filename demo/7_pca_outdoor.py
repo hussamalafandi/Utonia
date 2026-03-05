@@ -57,7 +57,7 @@ if __name__ == "__main__":
         model = utonia.load("utonia", repo_id="Pointcept/Utonia").to(device)
     else:
         custom_config = dict(
-            enc_patch_size=[1024 for _ in range(5)],  # reduce patch size if necessary
+            enc_patch_size=[256 for _ in range(5)],  # reduce patch size if necessary
             enable_flash=False,
         )
         model = utonia.load(
