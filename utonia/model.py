@@ -297,7 +297,13 @@ class SerializedAttention(PointModule):
             q, k, v = (
                 qkv.reshape(-1, K, 3, H, C // H).permute(2, 0, 3, 1, 4).unbind(dim=0)
             )
-            q, k = self.rope(q, k, rope_coord)
+            # rope expects 3D (total_N, H, C//H); reshape (N', H, K, C//H) accordingly
+            N_prime = q.shape[0]
+            q_3d = q.permute(0, 2, 1, 3).reshape(-1, H, C // H)
+            k_3d = k.permute(0, 2, 1, 3).reshape(-1, H, C // H)
+            q_3d, k_3d = self.rope(q_3d, k_3d, rope_coord)
+            q = q_3d.reshape(N_prime, K, H, C // H).permute(0, 2, 1, 3)
+            k = k_3d.reshape(N_prime, K, H, C // H).permute(0, 2, 1, 3)
             # attn
             if self.upcast_attention:
                 q = q.float()
