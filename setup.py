@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
-import pkg_resources
 from setuptools import setup, find_packages
 
 setup(
@@ -25,4 +22,15 @@ setup(
     author="Yujia Zhang",
     packages=find_packages(exclude=["demo*"]),
     include_package_data=True,
+    # Pure-Python requirements only. The compiled dependencies (spconv, torch_scatter,
+    # optionally flash_attn) are platform/CUDA specific and are declared by the
+    # consuming project (drive-vla's lock), not pinned here.
+    install_requires=[
+        "addict",
+        "huggingface_hub",
+        "numpy",
+        "scipy",
+        "timm",
+        "torch",
+    ],
 )
