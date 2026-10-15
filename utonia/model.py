@@ -144,6 +144,53 @@ class RPE(torch.nn.Module):
         return out
 
 
+@torch.no_grad()
+def padding_and_inverse(offset, patch_size):
+    """Patch padding of a batched point cloud: ``(pad, unpad, cu_seqlens)``.
+
+    Each sample with more than ``patch_size`` points is padded to a multiple of
+    ``patch_size`` by repeating its last full patch's tail; ``pad`` maps padded
+    positions to points, ``unpad`` maps points to padded positions and
+    ``cu_seqlens`` holds the patch boundaries (int32, for flash attention).
+
+    Vectorised form of the original per-sample loop, which indexed with GPU
+    scalars and synchronised the host several times per sample per stage. Here
+    the only sync is one read of the per-sample counts, needed for the output
+    shapes; the result is identical (integer index maths).
+    """
+    K = patch_size
+    device = offset.device
+    counts = offset2bincount(offset)
+    padded = torch.where(counts > K, (counts + K - 1) // K * K, counts)
+    n_chunks = (padded + K - 1) // K
+    n_real, n_pad, n_cu = (int(v) for v in torch.stack(
+        [counts.sum(), padded.sum(), n_chunks.sum()]
+    ).tolist())
+    start = torch.cumsum(counts, 0) - counts
+    start_pad = torch.cumsum(padded, 0) - padded
+    shift = start_pad - start
+    sample_ids = torch.arange(len(counts), device=device)
+
+    sample = torch.repeat_interleave(sample_ids, counts, output_size=n_real)
+    unpad = torch.arange(n_real, device=device) + shift[sample]
+
+    sample_pad = torch.repeat_interleave(sample_ids, padded, output_size=n_pad)
+    pos = torch.arange(n_pad, device=device)
+    # Tail positions (past the sample's real points) repeat the entries one patch
+    # earlier: the original loop's ``pad[tail] = pad[tail - K]``.
+    tail = (pos - start_pad[sample_pad]) >= counts[sample_pad]
+    pad = torch.where(tail, pos - K, pos) - shift[sample_pad]
+
+    chunk_sample = torch.repeat_interleave(sample_ids, n_chunks, output_size=n_cu)
+    chunk_rank = torch.arange(n_cu, device=device) - (torch.cumsum(n_chunks, 0) - n_chunks)[
+        chunk_sample
+    ]
+    cu_seqlens = torch.cat(
+        [start_pad[chunk_sample] + K * chunk_rank, padded.sum().reshape(1)]
+    ).to(torch.int32)
+    return pad, unpad, cu_seqlens
+
+
 class SerializedAttention(PointModule):
     def __init__(
         self,
@@ -225,52 +272,10 @@ class SerializedAttention(PointModule):
             or unpad_key not in point.keys()
             or cu_seqlens_key not in point.keys()
         ):
-            offset = point.offset
-            bincount = offset2bincount(offset)
-            bincount_pad = (
-                torch.div(
-                    bincount + self.patch_size - 1,
-                    self.patch_size,
-                    rounding_mode="trunc",
-                )
-                * self.patch_size
-            )
-            # only pad point when num of points larger than patch_size
-            mask_pad = bincount > self.patch_size
-            bincount_pad = ~mask_pad * bincount + mask_pad * bincount_pad
-            _offset = nn.functional.pad(offset, (1, 0))
-            _offset_pad = nn.functional.pad(torch.cumsum(bincount_pad, dim=0), (1, 0))
-            pad = torch.arange(_offset_pad[-1], device=offset.device)
-            unpad = torch.arange(_offset[-1], device=offset.device)
-            cu_seqlens = []
-            for i in range(len(offset)):
-                unpad[_offset[i] : _offset[i + 1]] += _offset_pad[i] - _offset[i]
-                if bincount[i] != bincount_pad[i]:
-                    pad[
-                        _offset_pad[i + 1]
-                        - self.patch_size
-                        + (bincount[i] % self.patch_size) : _offset_pad[i + 1]
-                    ] = pad[
-                        _offset_pad[i + 1]
-                        - 2 * self.patch_size
-                        + (bincount[i] % self.patch_size) : _offset_pad[i + 1]
-                        - self.patch_size
-                    ]
-                pad[_offset_pad[i] : _offset_pad[i + 1]] -= _offset_pad[i] - _offset[i]
-                cu_seqlens.append(
-                    torch.arange(
-                        _offset_pad[i],
-                        _offset_pad[i + 1],
-                        step=self.patch_size,
-                        dtype=torch.int32,
-                        device=offset.device,
-                    )
-                )
+            pad, unpad, cu_seqlens = padding_and_inverse(point.offset, self.patch_size)
             point[pad_key] = pad
             point[unpad_key] = unpad
-            point[cu_seqlens_key] = nn.functional.pad(
-                torch.concat(cu_seqlens), (0, 1), value=_offset_pad[-1]
-            )
+            point[cu_seqlens_key] = cu_seqlens
         return point[pad_key], point[unpad_key], point[cu_seqlens_key]
 
     def forward(self, point):
@@ -484,6 +489,7 @@ class GridPooling(PointModule):
         reduce="max",
         shuffle_orders=True,
         traceable=True,  # record parent and cluster
+        per_sample_depth=False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -493,6 +499,7 @@ class GridPooling(PointModule):
         assert reduce in ["sum", "mean", "min", "max"]
         self.reduce = reduce
         self.shuffle_orders = shuffle_orders
+        self.per_sample_depth = per_sample_depth
         self.traceable = traceable
 
         self.proj = nn.Linear(in_channels, out_channels)
@@ -514,16 +521,23 @@ class GridPooling(PointModule):
             raise AssertionError(
                 "[gird_coord] or [coord, grid_size] should be include in the Point"
             )
-        grid_coord = torch.div(grid_coord, self.stride, rounding_mode="trunc")
-        grid_coord = grid_coord | point.batch.view(-1, 1) << 48
-        grid_coord, cluster, counts = torch.unique(
-            grid_coord,
-            sorted=True,
-            return_inverse=True,
-            return_counts=True,
-            dim=0,
+        grid_coord = torch.div(grid_coord, self.stride, rounding_mode="trunc").long()
+        # One int64 key per point, (batch, x, y, z) in 16-bit fields: the same
+        # sorted order as torch.unique(dim=0) over the rows (batch, x), y, z, which
+        # is far slower. Grid coords are < 2^16 (serialization asserts depth <= 16).
+        key = (
+            point.batch.long() << 48
+            | grid_coord[:, 0] << 32
+            | grid_coord[:, 1] << 16
+            | grid_coord[:, 2]
         )
-        grid_coord = grid_coord & ((1 << 48) - 1)
+        key, cluster, counts = torch.unique(
+            key, sorted=True, return_inverse=True, return_counts=True
+        )
+        mask16 = (1 << 16) - 1
+        grid_coord = torch.stack(
+            [(key >> 32) & mask16, (key >> 16) & mask16, key & mask16], dim=1
+        )
         # indices of point sorted by cluster, for torch_scatter.segment_csr
         _, indices = torch.sort(cluster)
         # index pointer for sorted point, for torch_scatter.segment_csr
@@ -569,7 +583,11 @@ class GridPooling(PointModule):
             point = self.norm(point)
         if self.act is not None:
             point = self.act(point)
-        point.serialization(order=order, shuffle_orders=self.shuffle_orders)
+        point.serialization(
+            order=order,
+            shuffle_orders=self.shuffle_orders,
+            per_sample_depth=self.per_sample_depth,
+        )
         point.sparsify()
         return point
 
@@ -685,9 +703,15 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
         shift_coords=None,
         jitter_coords=None,
         rescale_coords=None,
+        per_sample_depth=False,
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
+        # Serialize each sample in its own cube (depth from its own extent) instead
+        # of one cube sized by the largest sample in the batch: the Hilbert orders
+        # depend on the depth, so with the batch-wide depth a sample's patches (and
+        # its features) change with the other samples it is batched with.
+        self.per_sample_depth = per_sample_depth
         self.order = [order] if isinstance(order, str) else order
         self.enc_mode = enc_mode
         self.shuffle_orders = shuffle_orders
@@ -734,6 +758,7 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
                         stride=stride[s - 1],
                         norm_layer=ln_layer,
                         act_layer=act_layer,
+                        per_sample_depth=per_sample_depth,
                     ),
                     name="down",
                 )
@@ -845,7 +870,11 @@ class PointTransformerV3(PointModule, PyTorchModelHubMixin):
         point = Point(data_dict)
         point = self.embedding(point)
 
-        point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
+        point.serialization(
+            order=self.order,
+            shuffle_orders=self.shuffle_orders,
+            per_sample_depth=self.per_sample_depth,
+        )
         point.sparsify()
 
         point = self.enc(point)
