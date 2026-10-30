@@ -48,6 +48,51 @@ def encode(grid_coord, batch=None, depth=16, order="z"):
 
 
 @torch.inference_mode()
+def encode_orders(grid_coord, batch, depth, orders):
+    """Batched serialization codes for several orders: ``(len(orders), N)``.
+
+    Same codes as ``torch.stack([encode(grid_coord, batch, depth, o) for o in
+    orders])``, with two changes in cost and one in meaning:
+
+    - the Hilbert orders are encoded in one call over the stacked (plain and
+      transposed) coordinates: Hilbert encoding is a Python loop of tiny kernels
+      over bits x dims, so this halves its launches;
+    - ``depth`` may be a per-sample list. Each sample is then Hilbert-encoded in
+      its own cube, which makes its order independent of the other samples in
+      the batch (z-order codes do not depend on the depth). The batch index
+      still occupies the top bits above the largest depth, so codes sort by
+      sample first.
+    """
+    orders = [orders] if isinstance(orders, str) else list(orders)
+    assert set(orders) <= {"z", "z-trans", "hilbert", "hilbert-trans"}, orders
+    per_sample = isinstance(depth, (list, tuple))
+    depth_max = max(depth) if per_sample else depth
+    trans = grid_coord[:, [1, 0, 2]]
+    codes = {}
+    hilbert_orders = [o for o in orders if o.startswith("hilbert")]
+    if hilbert_orders:
+        coords = torch.cat([grid_coord if o == "hilbert" else trans for o in hilbert_orders])
+        if not per_sample or len(set(depth)) == 1:
+            code = hilbert_encode(coords, depth=depth_max)
+        else:
+            point_depth = torch.as_tensor(depth, device=grid_coord.device)[batch.long()]
+            point_depth = point_depth.repeat(len(hilbert_orders))
+            code = torch.empty(coords.shape[0], dtype=torch.long, device=grid_coord.device)
+            for d in sorted(set(depth)):
+                sel = point_depth == d
+                code[sel] = hilbert_encode(coords[sel], depth=d)
+        codes.update(zip(hilbert_orders, code.split(grid_coord.shape[0])))
+    if "z" in orders:
+        codes["z"] = z_order_encode(grid_coord, depth=depth_max)
+    if "z-trans" in orders:
+        codes["z-trans"] = z_order_encode(trans, depth=depth_max)
+    code = torch.stack([codes[o] for o in orders])
+    if batch is not None:
+        code = batch.long() << depth_max * 3 | code
+    return code
+
+
+@torch.inference_mode()
 def decode(code, depth=16, order="z"):
     assert order in {"z", "hilbert"}
     batch = code >> depth * 3

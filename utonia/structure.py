@@ -24,7 +24,7 @@ import torch
 import spconv.pytorch as spconv
 from addict import Dict
 
-from .serialization import encode
+from .serialization import encode, encode_orders
 from .utils import offset2batch, batch2offset
 
 
@@ -61,11 +61,17 @@ class Point(Dict):
         elif "offset" not in self.keys() and "batch" in self.keys():
             self["offset"] = batch2offset(self.batch)
 
-    def serialization(self, order="z", depth=None, shuffle_orders=False):
+    def serialization(
+        self, order="z", depth=None, shuffle_orders=False, per_sample_depth=False
+    ):
         """
         Point Cloud Serialization
 
         relay on ["grid_coord" or "coord" + "grid_size", "batch", "feat"]
+
+        per_sample_depth: size each sample's serialization cube by its own extent
+        instead of the batch's largest sample (Hilbert codes depend on the cube
+        size, so the batch-wide depth couples a sample's order to its batch mates).
         """
         self["order"] = order
         assert "batch" in self.keys()
@@ -82,25 +88,31 @@ class Point(Dict):
 
         if depth is None:
             # Adaptive measure the depth of serialization cube (length = 2 ^ depth)
-            depth = int(self.grid_coord.max() + 1).bit_length()
-        self["serialized_depth"] = depth
+            if per_sample_depth:
+                sample_max = torch.zeros(
+                    len(self.offset), dtype=self.grid_coord.dtype, device=self.grid_coord.device
+                ).scatter_reduce_(
+                    0, self.batch.long(), self.grid_coord.amax(1), "amax", include_self=False
+                )
+                depth = [int(m + 1).bit_length() for m in sample_max.tolist()]
+            else:
+                depth = int(self.grid_coord.max() + 1).bit_length()
+        depth_max = max(depth) if isinstance(depth, (list, tuple)) else depth
+        self["serialized_depth"] = depth_max
         # Maximum bit length for serialization code is 63 (int64)
-        assert depth * 3 + len(self.offset).bit_length() <= 63
+        assert depth_max * 3 + len(self.offset).bit_length() <= 63
         # Here we follow OCNN and set the depth limitation to 16 (48bit) for the point position.
         # Although depth is limited to less than 16, we can encode a 655.36^3 (2^16 * 0.01) meter^3
         # cube with a grid size of 0.01 meter. We consider it is enough for the current stage.
         # We can unlock the limitation by optimizing the z-order encoding function if necessary.
-        assert depth <= 16
+        assert depth_max <= 16
 
         # The serialization codes are arranged as following structures:
         # [Order1 ([n]),
         #  Order2 ([n]),
         #   ...
         #  OrderN ([n])] (k, n)
-        code = [
-            encode(self.grid_coord, self.batch, depth, order=order_) for order_ in order
-        ]
-        code = torch.stack(code)
+        code = encode_orders(self.grid_coord, self.batch, depth, orders=order)
         order = torch.argsort(code)
         inverse = torch.zeros_like(order).scatter_(
             dim=1,
